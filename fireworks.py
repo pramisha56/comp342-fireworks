@@ -1,729 +1,856 @@
 import glfw
 from OpenGL.GL import *
+from OpenGL.GLU import *
 import numpy as np
-import ctypes, math, time, random
-
-# =========================
-# GLSL SHADERS (embedded)
-# =========================
-PARTICLE_VERT = """
-#version 330 core
-layout (location=0) in vec2 aPos;
-layout (location=1) in vec2 aUV;
-
-layout (location=2) in vec3 iPos;
-layout (location=3) in vec4 iColor;
-layout (location=4) in float iSize;
-layout (location=5) in float iLife;
-
-uniform mat4 uProj;
-uniform mat4 uView;
-uniform vec3 uCamRight;
-uniform vec3 uCamUp;
-uniform vec3 uCamPos;
-
-out vec2 vUV;
-out vec4 vColor;
-out float vLife;
-out float vDist;
-
-void main(){
-    float dist = length(iPos - uCamPos);
-    float atten = 1.0 / (0.07 * dist + 1.0);
-
-    vec3 worldPos = iPos + (uCamRight * aPos.x + uCamUp * aPos.y) * iSize * atten;
-
-    gl_Position = uProj * uView * vec4(worldPos, 1.0);
-
-    vUV = aUV;
-    vColor = iColor;
-    vLife = iLife;
-    vDist = dist;
-}
-"""
-
-PARTICLE_FRAG = """
-#version 330 core
-in vec2 vUV;
-in vec4 vColor;
-in float vLife;
-in float vDist;
-
-out vec4 FragColor;
-
-uniform sampler2D uTex;
-uniform float uFogStart = 45.0;
-uniform float uFogEnd   = 160.0;
-
-void main(){
-    vec4 tex = texture(uTex, vUV);
-
-    // smooth lifetime fade
-    float fade = smoothstep(0.0, 0.15, vLife) * smoothstep(0.0, 1.0, vLife);
-
-    // fog
-    float fog = clamp((uFogEnd - vDist) / (uFogEnd - uFogStart), 0.0, 1.0);
-
-    // bright HDR-ish output (additive blending)
-    vec3 col = vColor.rgb * 2.3;
-
-    float alpha = tex.a * fade * fog;
-    FragColor = vec4(col * tex.r, alpha);
-}
-"""
-
-SKY_VERT = """
-#version 330 core
-layout (location=0) in vec2 aPos;
-out vec2 vPos;
-void main(){
-    vPos = aPos;
-    gl_Position = vec4(aPos, 0.0, 1.0);
-}
-"""
-
-SKY_FRAG = """
-#version 330 core
-in vec2 vPos;
-out vec4 FragColor;
-void main(){
-    float t = (vPos.y + 1.0) * 0.5;
-    vec3 top = vec3(0.01, 0.02, 0.06);
-    vec3 bottom = vec3(0.00, 0.00, 0.02);
-    vec3 col = mix(bottom, top, t);
-    FragColor = vec4(col, 1.0);
-}
-"""
-
-# =========================
-# Small math helpers
-# =========================
-def normalize(v):
-    n = np.linalg.norm(v)
-    return v / (n + 1e-8)
-
-def perspective(fov_deg, aspect, near, far):
-    f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
-    M = np.zeros((4,4), dtype=np.float32)
-    M[0,0] = f / aspect
-    M[1,1] = f
-    M[2,2] = (far + near) / (near - far)
-    M[2,3] = (2 * far * near) / (near - far)
-    M[3,2] = -1.0
-    return M
-
-def look_at(eye, center, up):
-    f = normalize(center - eye)
-    s = normalize(np.cross(f, up))
-    u = np.cross(s, f)
-
-    M = np.eye(4, dtype=np.float32)
-    M[0,:3] = s
-    M[1,:3] = u
-    M[2,:3] = -f
-    T = np.eye(4, dtype=np.float32)
-    T[:3,3] = -eye
-    return M @ T
-
-# =========================
-# Shader compile/link
-# =========================
-def compile_shader(src, shader_type):
-    sh = glCreateShader(shader_type)
-    glShaderSource(sh, src)
-    glCompileShader(sh)
-    ok = glGetShaderiv(sh, GL_COMPILE_STATUS)
-    if not ok:
-        msg = glGetShaderInfoLog(sh).decode()
-        raise RuntimeError(f"Shader compile error:\n{msg}")
-    return sh
-
-def make_program(vs_src, fs_src):
-    vs = compile_shader(vs_src, GL_VERTEX_SHADER)
-    fs = compile_shader(fs_src, GL_FRAGMENT_SHADER)
-    prog = glCreateProgram()
-    glAttachShader(prog, vs)
-    glAttachShader(prog, fs)
-    glLinkProgram(prog)
-    ok = glGetProgramiv(prog, GL_LINK_STATUS)
-    if not ok:
-        msg = glGetProgramInfoLog(prog).decode()
-        raise RuntimeError(f"Program link error:\n{msg}")
-    glDeleteShader(vs)
-    glDeleteShader(fs)
-    return prog
-
-def set_mat4(prog, name, mat):
-    loc = glGetUniformLocation(prog, name)
-    glUniformMatrix4fv(loc, 1, GL_FALSE, mat.T)
-
-    glClearColor(0.05, 0.05, 0.10, 1.0)
+import random
+import math
+import time
+from dataclasses import dataclass
+from typing import List
 
 
-
-def set_vec3(prog, name, v):
-    loc = glGetUniformLocation(prog, name)
-    glUniform3f(loc, float(v[0]), float(v[1]), float(v[2]))
-
-def set_int(prog, name, i):
-    loc = glGetUniformLocation(prog, name)
-    glUniform1i(loc, i)
-
-# =========================
-# Glow texture generated in code (no assets)
-# =========================
-def make_glow_texture(size=128):
-    y, x = np.mgrid[0:size, 0:size].astype(np.float32)
-    cx = (size-1) / 2.0
-    cy = (size-1) / 2.0
-    r = np.sqrt((x-cx)**2 + (y-cy)**2) / (size*0.5)
-    # soft radial falloff
-    alpha = np.clip(1.0 - r, 0.0, 1.0)
-    alpha = alpha**2.2
-
-    # single-channel glow into RGBA
-    img = np.zeros((size, size, 4), dtype=np.uint8)
-    val = (alpha * 255).astype(np.uint8)
-    img[...,0] = val
-    img[...,1] = val
-    img[...,2] = val
-    img[...,3] = val
-
-    tex = glGenTextures(1)
-    glBindTexture(GL_TEXTURE_2D, tex)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, img)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-    glBindTexture(GL_TEXTURE_2D, 0)
-    return tex
-
-# =========================
-# Camera (smooth FPS style)
-# =========================
-class Camera:
-    def __init__(self):
-        self.pos = np.array([0.0, 8.0, 35.0], dtype=np.float32)
-        self.yaw = -90.0
-        self.pitch = -5.0
-        self.fov = 55.0
-        self.speed = 14.0
-        self.sens = 0.08
-
-        self.front = np.array([0,0,-1], dtype=np.float32)
-        self.up = np.array([0,1,0], dtype=np.float32)
-        self.right = np.array([1,0,0], dtype=np.float32)
-        self.world_up = np.array([0,1,0], dtype=np.float32)
-
-        self._first = True
-        self._lastx = 0
-        self._lasty = 0
-
-        self.smooth_pos = self.pos.copy()
-        self.smooth_factor = 12.0
-
-        self.view = np.eye(4, dtype=np.float32)
-        self.proj = np.eye(4, dtype=np.float32)
-        self.update_vectors()
-
-    def update_vectors(self):
-        cy = math.cos(math.radians(self.yaw))
-        sy = math.sin(math.radians(self.yaw))
-        cp = math.cos(math.radians(self.pitch))
-        sp = math.sin(math.radians(self.pitch))
-        f = np.array([cy*cp, sp, sy*cp], dtype=np.float32)
-        self.front = normalize(f)
-        self.right = normalize(np.cross(self.front, self.world_up))
-        self.up = np.cross(self.right, self.front)
-
-    def mouse(self, window):
-        x, y = glfw.get_cursor_pos(window)
-        if self._first:
-            self._lastx, self._lasty = x, y
-            self._first = False
-        dx = (x - self._lastx) * self.sens
-        dy = (self._lasty - y) * self.sens
-        self._lastx, self._lasty = x, y
-
-        self.yaw += dx
-        self.pitch = max(-89.0, min(89.0, self.pitch + dy))
-        self.update_vectors()
-
-    def update(self, window, dt, aspect):
-        self.mouse(window)
-
-        v = self.speed * dt
-        if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
-            self.pos += self.front * v
-        if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
-            self.pos -= self.front * v
-        if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
-            self.pos -= self.right * v
-        if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
-            self.pos += self.right * v
-        if glfw.get_key(window, glfw.KEY_SPACE) == glfw.PRESS:
-            self.pos += self.world_up * v
-        if glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS:
-            self.pos -= self.world_up * v
-
-        # smooth movement
-        a = 1.0 - math.exp(-self.smooth_factor * dt)
-        self.smooth_pos = self.smooth_pos*(1-a) + self.pos*a
-
-        self.view = look_at(self.smooth_pos, self.smooth_pos + self.front, self.up)
-        self.proj = perspective(self.fov, aspect, 0.1, 500.0)
-
-# =========================
-# Particle system (GPU instanced)
-# =========================
-class ParticleSystem:
-    def __init__(self, max_particles=20000):
-        self.max = max_particles
-        self.count = 0
-        self.pos = np.zeros((self.max,3), dtype=np.float32)
-        self.vel = np.zeros((self.max,3), dtype=np.float32)
-        self.col = np.zeros((self.max,4), dtype=np.float32)
-        self.life = np.zeros((self.max,), dtype=np.float32)
-        self.size = np.zeros((self.max,), dtype=np.float32)
-
-        self.instance = np.zeros((self.max, 9), dtype=np.float32)  # pos(3)+color(4)+size+life
-
-        self.prog = make_program(PARTICLE_VERT, PARTICLE_FRAG)
-        self.tex = make_glow_texture(128)
-        self._make_buffers()
-
-    def _make_buffers(self):
-        # quad vertices: aPos(xy) aUV(xy)
-        quad = np.array([
-            -0.5,-0.5, 0.0,0.0,
-             0.5,-0.5, 1.0,0.0,
-             0.5, 0.5, 1.0,1.0,
-            -0.5, 0.5, 0.0,1.0
+class TransformationMatrix:
+    @staticmethod
+    def identity():
+        """
+        Identity Matrix - no transformation
+        [1 0 0 0]
+        [0 1 0 0]
+        [0 0 1 0]
+        [0 0 0 1]
+        """
+        return np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
         ], dtype=np.float32)
-        idx = np.array([0,1,2, 2,3,0], dtype=np.uint32)
+    
+    @staticmethod
+    def translation(tx, ty, tz):
+        """
+        Translation Matrix
+        
+        Mathematical form:
+        [1  0  0  tx]   [x]   [x + tx]
+        [0  1  0  ty] × [y] = [y + ty]
+        [0  0  1  tz]   [z]   [z + tz]
+        [0  0  0  1 ]   [1]   [  1   ]
+        """
+        return np.array([
+            [1.0, 0.0, 0.0, tx],
+            [0.0, 1.0, 0.0, ty],
+            [0.0, 0.0, 1.0, tz],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def rotation_x(angle_degrees):
+        """
+        Rotation around X-axis
+        
+        Mathematical form:
+        [1    0         0      0]
+        [0  cos(θ)  -sin(θ)   0]
+        [0  sin(θ)   cos(θ)   0]
+        [0    0         0      1]
+        """
+        theta = math.radians(angle_degrees)
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        
+        return np.array([
+            [1.0, 0.0,        0.0,         0.0],
+            [0.0, cos_theta, -sin_theta,   0.0],
+            [0.0, sin_theta,  cos_theta,   0.0],
+            [0.0, 0.0,        0.0,         1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def rotation_y(angle_degrees):
+        """
+        Rotation around Y-axis
+        
+        Mathematical form:
+        [ cos(θ)   0  sin(θ)  0]
+        [   0      1    0     0]
+        [-sin(θ)   0  cos(θ)  0]
+        [   0      0    0     1]
+        """
+        theta = math.radians(angle_degrees)
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        
+        return np.array([
+            [ cos_theta, 0.0, sin_theta, 0.0],
+            [ 0.0,       1.0, 0.0,       0.0],
+            [-sin_theta, 0.0, cos_theta, 0.0],
+            [ 0.0,       0.0, 0.0,       1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def rotation_z(angle_degrees):
+        """
+        Rotation around Z-axis
+        
+        Mathematical form:
+        [cos(θ)  -sin(θ)  0  0]
+        [sin(θ)   cos(θ)  0  0]
+        [  0        0     1  0]
+        [  0        0     0  1]
+        """
+        theta = math.radians(angle_degrees)
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        
+        return np.array([
+            [cos_theta, -sin_theta, 0.0, 0.0],
+            [sin_theta,  cos_theta, 0.0, 0.0],
+            [0.0,        0.0,       1.0, 0.0],
+            [0.0,        0.0,       0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def rotation_arbitrary(angle_degrees, axis):
+        """
+        Rotation around arbitrary axis
+        Uses Rodrigues' rotation formula. Something new, not in our course.
+        
+        axis: normalized 3D vector [x, y, z]
+        """
+        theta = math.radians(angle_degrees)
+        
+        # Normalize axis
+        axis_length = math.sqrt(axis[0]**2 + axis[1]**2 + axis[2]**2)
+        if axis_length == 0:
+            return TransformationMatrix.identity()
+        
+        ux = axis[0] / axis_length
+        uy = axis[1] / axis_length
+        uz = axis[2] / axis_length
+        
+        cos_theta = math.cos(theta)
+        sin_theta = math.sin(theta)
+        one_minus_cos = 1.0 - cos_theta
+        
+        # Rodrigues' formula components
+        return np.array([
+            [
+                cos_theta + ux*ux*one_minus_cos,
+                ux*uy*one_minus_cos - uz*sin_theta,
+                ux*uz*one_minus_cos + uy*sin_theta,
+                0.0
+            ],
+            [
+                uy*ux*one_minus_cos + uz*sin_theta,
+                cos_theta + uy*uy*one_minus_cos,
+                uy*uz*one_minus_cos - ux*sin_theta,
+                0.0
+            ],
+            [
+                uz*ux*one_minus_cos - uy*sin_theta,
+                uz*uy*one_minus_cos + ux*sin_theta,
+                cos_theta + uz*uz*one_minus_cos,
+                0.0
+            ],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def scaling(sx, sy, sz):
+        """
+        Scaling Matrix
+        Scales by factors (sx, sy, sz)
+        
+        Mathematical form:
+        [sx  0   0  0]   [x]   [sx·x]
+        [0  sy   0  0] × [y] = [sy·y]
+        [0   0  sz  0]   [z]   [sz·z]
+        [0   0   0  1]   [1]   [ 1  ]
+        """
+        return np.array([
+            [sx,  0.0, 0.0, 0.0],
+            [0.0, sy,  0.0, 0.0],
+            [0.0, 0.0, sz,  0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def shearing_xy(shx, shy):
+        """
+        Shearing in XY plane
+        shx: shear X based on Y
+        shy: shear Y based on X
+        
+        Mathematical form:
+        [1   shx  0  0]   [x]   [x + shx·y]
+        [shy  1   0  0] × [y] = [y + shy·x]
+        [0    0   1  0]   [z]   [    z    ]
+        [0    0   0  1]   [1]   [    1    ]
+        """
+        return np.array([
+            [1.0, shx, 0.0, 0.0],
+            [shy, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def shearing_xz(shx, shz):
+        """
+        Shearing in XZ plane
+        shx: shear X based on Z
+        shz: shear Z based on X
+        """
+        return np.array([
+            [1.0, 0.0, shx, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [shz, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def shearing_yz(shy, shz):
+        """
+        Shearing in YZ plane
+        shy: shear Y based on Z
+        shz: shear Z based on Y
+        """
+        return np.array([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, shy, 0.0],
+            [0.0, shz, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def apply_to_point(matrix, point):
+        """
+        Apply 4x4 transformation matrix to a 3D point
+        
+        Process:
+        1. Convert point to homogeneous coordinates [x, y, z, 1]
+        2. Multiply by transformation matrix
+        3. Convert back to 3D coordinates
+        
+        Returns: Transformed 3D point as numpy array
+        """
+        # Convert to homogeneous coordinates
+        homogeneous_point = np.array([
+            point[0],
+            point[1],
+            point[2],
+            1.0
+        ], dtype=np.float32)
+        
+        # Matrix multiplication: M × P
+        transformed = np.dot(matrix, homogeneous_point)
+        
+        # Convert back to 3D (perspective divide if w != 1)
+        if transformed[3] != 0.0:
+            return np.array([
+                transformed[0] / transformed[3],
+                transformed[1] / transformed[3],
+                transformed[2] / transformed[3]
+            ], dtype=np.float32)
+        
+        return np.array([
+            transformed[0],
+            transformed[1],
+            transformed[2]
+        ], dtype=np.float32)
+    
+    @staticmethod
+    def compose(*matrices):
+        """
+        Compose multiple transformation matrices
+        Matrices are applied right-to-left (like function composition)
+        
+        Example:
+            M = compose(M1, M2, M3)
+            Applies: M3, then M2, then M1
+        """
+        result = TransformationMatrix.identity()
+        
+        # Apply in reverse order (right-to-left)
+        for matrix in reversed(matrices):
+            result = np.dot(result, matrix)
+        
+        return result
 
-        self.vao = glGenVertexArrays(1)
-        glBindVertexArray(self.vao)
 
-        self.vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-        glBufferData(GL_ARRAY_BUFFER, quad.nbytes, quad, GL_STATIC_DRAW)
+@dataclass
+class Particle:
+    """Particle with position, velocity, color, and life"""
+    position: np.ndarray
+    velocity: np.ndarray
+    color: np.ndarray
+    life: float
+    size: float
+    trail: list
 
-        self.ebo = glGenBuffers(1)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL_STATIC_DRAW)
 
-        stride = 16
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(8))
-
-        self.inst_vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, self.inst_vbo)
-        glBufferData(GL_ARRAY_BUFFER, self.instance.nbytes, None, GL_STREAM_DRAW)
-
-        inst_stride = 9 * 4
-        # iPos
-        glEnableVertexAttribArray(2)
-        glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, inst_stride, ctypes.c_void_p(0))
-        glVertexAttribDivisor(2, 1)
-        # iColor
-        glEnableVertexAttribArray(3)
-        glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, inst_stride, ctypes.c_void_p(12))
-        glVertexAttribDivisor(3, 1)
-        # iSize
-        glEnableVertexAttribArray(4)
-        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, inst_stride, ctypes.c_void_p(28))
-        glVertexAttribDivisor(4, 1)
-        # iLife
-        glEnableVertexAttribArray(5)
-        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, inst_stride, ctypes.c_void_p(32))
-        glVertexAttribDivisor(5, 1)
-
-        glBindVertexArray(0)
-
-    def spawn(self, p, v, c, s, l):
-        n = len(l)
-        space = self.max - self.count
-        n = min(n, space)
-        if n <= 0:
+class Firework:
+    """Firework with rocket and explosion particles"""
+    
+    def __init__(self, position, firework_type="burst"):
+        self.position = position.copy()
+        self.particles = []
+        self.exploded = False
+        self.rocket = None
+        self.type = firework_type
+        self.age = 0.0
+        
+        self.launch_rocket()
+    
+    def launch_rocket(self):
+        """Launch rocket particle"""
+        velocity = np.array([
+            random.uniform(-0.5, 0.5),
+            random.uniform(18.0, 25.0),
+            random.uniform(-0.5, 0.5)
+        ], dtype=np.float32)
+        
+        self.rocket = Particle(
+            position=self.position.copy(),
+            velocity=velocity,
+            color=np.array([1.0, 1.0, 0.8, 1.0], dtype=np.float32),
+            life=1.0,
+            size=3.0,
+            trail=[]
+        )
+    
+    def explode(self):
+        """Create explosion using transformation matrices"""
+        if self.exploded:
             return
-        i0, i1 = self.count, self.count + n
-        self.pos[i0:i1] = p[:n]
-        self.vel[i0:i1] = v[:n]
-        self.col[i0:i1] = c[:n]
-        self.size[i0:i1] = s[:n]
-        self.life[i0:i1] = l[:n]
-        self.count = i1
-
-    def update(self, dt):
-        if self.count == 0:
-            return
-
-        t = time.time()
-        wind = np.array([0.35*math.sin(t*0.6), 0.0, 0.2*math.cos(t*0.4)], dtype=np.float32)
-        g = np.array([0.0, -9.81, 0.0], dtype=np.float32)
-
-        p = self.pos[:self.count]
-        v = self.vel[:self.count]
-        life = self.life[:self.count]
-
-        speed = np.linalg.norm(v, axis=1) + 1e-6
-        drag = 0.06 * speed
-        v -= (v * drag[:,None]) * dt
-        turb = (np.random.rand(self.count,3).astype(np.float32)-0.5)*0.9
-
-        v += (g + wind) * dt + turb * dt
-        p += v * dt
-
-        life -= dt * 0.45
-
-        alive = life > 0.0
-        idx = np.where(alive)[0]
-        newc = len(idx)
-
-        self.pos[:newc] = p[idx]
-        self.vel[:newc] = v[idx]
-        self.col[:newc] = self.col[:self.count][idx]
-        self.size[:newc] = self.size[:self.count][idx]
-        self.life[:newc] = life[idx]
-        self.count = newc
-
-    def upload(self):
-        if self.count == 0:
-            return
-        self.instance[:self.count, 0:3] = self.pos[:self.count]
-        self.instance[:self.count, 3:7] = self.col[:self.count]
-        self.instance[:self.count, 7] = self.size[:self.count]
-        self.instance[:self.count, 8] = self.life[:self.count]
-
-        glBindBuffer(GL_ARRAY_BUFFER, self.inst_vbo)
-        glBufferSubData(GL_ARRAY_BUFFER, 0, self.instance[:self.count].nbytes, self.instance[:self.count])
-
-    def render(self, cam: Camera):
-        if self.count == 0:
-            return
-
-        self.upload()
-
-        glUseProgram(self.prog)
-        set_mat4(self.prog, "uProj", cam.proj)
-        set_mat4(self.prog, "uView", cam.view)
-        set_vec3(self.prog, "uCamRight", cam.right)
-        set_vec3(self.prog, "uCamUp", cam.up)
-        set_vec3(self.prog, "uCamPos", cam.smooth_pos)
-        set_int(self.prog, "uTex", 0)
-
-        glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, self.tex)
-
-        glDepthMask(GL_FALSE)
-        glBlendFunc(GL_ONE, GL_ONE)
-
-        glBindVertexArray(self.vao)
-        glDrawElementsInstanced(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None, self.count)
-        glBindVertexArray(0)
-
-        glDepthMask(GL_TRUE)
-
-# =========================
-# Fireworks logic (few types, still single-file)
-# =========================
-def hsv_to_rgb(h, s, v):
-    i = int(h*6); f = h*6-i
-    p = v*(1-s); q = v*(1-f*s); t = v*(1-(1-f)*s)
-    i %= 6
-    if i==0: return v,t,p
-    if i==1: return q,v,p
-    if i==2: return p,v,t
-    if i==3: return p,q,v
-    if i==4: return t,p,v
-    return v,p,q
-
-class Fireworks:
-    def __init__(self):
-        self.ps = ParticleSystem(22000)
-        self.rockets = []  # pos, vel, fuse, type, stage
-        self.last = 0.0
-        self.interval = 1.2
-        self.auto = True
-
-    def launch(self, pos=None, ftype=None):
-        if pos is None:
-            pos = np.array([random.uniform(-18,18), 0.0, random.uniform(-18,18)], dtype=np.float32)
-        if ftype is None:
-            ftype = random.choice(["burst","ring","heart","spiral","double","crackle"])
-        vel = np.array([random.uniform(-1,1), random.uniform(18,26), random.uniform(-1,1)], dtype=np.float32)
-        fuse = random.uniform(1.4, 2.1)
-        self.rockets.append([pos, vel, fuse, ftype, 0])
-
-    def update(self, dt):
-        now = time.time()
-        if self.auto and (now - self.last) > self.interval:
-            self.launch()
-            self.last = now
-
-        g = np.array([0,-9.81,0], dtype=np.float32)
-        wind = np.array([0.25*math.sin(now*0.5), 0.0, 0.2*math.cos(now*0.3)], dtype=np.float32)
-
-        newr = []
-        for pos, vel, fuse, ftype, stage in self.rockets:
-            vel += (g + wind) * dt
-            pos += vel * dt
-            fuse -= dt
-
-            # rocket trail
-            n = 6
-            tp = np.repeat(pos[None,:], n, axis=0)
-            tv = (np.random.rand(n,3).astype(np.float32)-0.5)*1.2
-            tc = np.zeros((n,4), dtype=np.float32)
-            tc[:,:3] = np.array([1.0,0.8,0.3])
-            tc[:,3] = 1.0
-            ts = np.full((n,), 7.0, dtype=np.float32)
-            tl = np.full((n,), 0.35, dtype=np.float32)
-            self.ps.spawn(tp,tv,tc,ts,tl)
-
-            if fuse <= 0 or vel[1] < 0:
-                self.explode(pos, ftype, stage)
+        
+        self.exploded = True
+        explosion_position = self.rocket.position.copy()
+        
+        # Number of particles
+        num_particles = random.randint(150, 250)
+        
+        # Random color
+        base_hue = random.random()
+        
+        # Random rotation for variety (ROTATION TRANSFORMATION)
+        rotation_angle = random.uniform(0, 360)
+        rotation_axis = np.array([
+            random.uniform(-1, 1),
+            random.uniform(0.5, 1),
+            random.uniform(-1, 1)
+        ], dtype=np.float32)
+        
+        for i in range(num_particles):
+            
+            # Generate base velocity based on type
+            if self.type == "burst":
+                # Spherical burst
+                theta = random.uniform(0, 2 * math.pi)
+                phi = random.uniform(0, math.pi)
+                speed = random.uniform(10.0, 16.0)
+                
+                base_velocity = np.array([
+                    speed * math.sin(phi) * math.cos(theta),
+                    speed * math.cos(phi),
+                    speed * math.sin(phi) * math.sin(theta)
+                ], dtype=np.float32)
+                
+            elif self.type == "ring":
+                # Circular ring (SCALING TRANSFORMATION - flatten Y)
+                angle = (i / num_particles) * 2 * math.pi
+                speed = random.uniform(12.0, 18.0)
+                
+                base_velocity = np.array([
+                    speed * math.cos(angle),
+                    random.uniform(-1.0, 1.0),
+                    speed * math.sin(angle)
+                ], dtype=np.float32)
+                
+            elif self.type == "fountain":
+                # Fountain with shearing (SHEARING TRANSFORMATION)
+                angle = random.uniform(0, 2 * math.pi)
+                speed = random.uniform(8.0, 14.0)
+                vertical_bias = random.uniform(0.6, 0.9)
+                
+                base_velocity = np.array([
+                    speed * math.cos(angle) * (1 - vertical_bias),
+                    speed * vertical_bias,
+                    speed * math.sin(angle) * (1 - vertical_bias)
+                ], dtype=np.float32)
+                
+            elif self.type == "willow":
+                # Willow droop effect
+                theta = random.uniform(0, 2 * math.pi)
+                phi = random.uniform(0, math.pi / 2)
+                speed = random.uniform(7.0, 12.0)
+                
+                base_velocity = np.array([
+                    speed * math.sin(phi) * math.cos(theta),
+                    speed * math.cos(phi) * 0.4,
+                    speed * math.sin(phi) * math.sin(theta)
+                ], dtype=np.float32)
+                
             else:
-                newr.append([pos, vel, fuse, ftype, stage])
-        self.rockets = newr
-
-        self.ps.update(dt)
-
-    def explode(self, pos, ftype, stage):
-        base_h = random.random()
-        if ftype == "heart":
-            self._heart(pos)
-        elif ftype == "spiral":
-            self._spiral(pos, base_h)
-        elif ftype == "double":
-            if stage == 0:
-                self._burst(pos, base_h, 200, (7,12))
-                self.rockets.append([pos.copy(), np.array([0, random.uniform(5,9), 0],dtype=np.float32),
-                                     random.uniform(0.35,0.6), "burst", 1])
+                base_velocity = np.array([
+                    random.uniform(-12.0, 12.0),
+                    random.uniform(-12.0, 12.0),
+                    random.uniform(-12.0, 12.0)
+                ], dtype=np.float32)
+            
+            # APPLY ROTATION TRANSFORMATION
+            R = TransformationMatrix.rotation_arbitrary(rotation_angle, rotation_axis)
+            rotated_velocity = TransformationMatrix.apply_to_point(R, base_velocity)
+            
+            # APPLY SCALING TRANSFORMATION
+            scale_variation = random.uniform(0.85, 1.15)
+            S = TransformationMatrix.scaling(scale_variation, scale_variation, scale_variation)
+            scaled_velocity = TransformationMatrix.apply_to_point(S, rotated_velocity)
+            
+            # APPLY SHEARING TRANSFORMATION (for certain types)
+            if self.type in ["fountain", "willow"]:
+                shear_factor = random.uniform(-0.4, 0.4)
+                SH = TransformationMatrix.shearing_xy(shear_factor, 0.0)
+                final_velocity = TransformationMatrix.apply_to_point(SH, scaled_velocity)
             else:
-                self._burst(pos, (base_h+0.2)%1.0, 260, (9,15))
-        elif ftype == "crackle":
-            self._burst(pos, base_h, 160, (7,12))
-            self._crackle(pos)
-        elif ftype == "ring":
-            self._ring(pos, base_h)
-        else:
-            self._burst(pos, base_h, 220, (8,14))
-
-    def _burst(self, pos, base_h, n, speed_rng):
-        theta = np.random.rand(n).astype(np.float32) * (2*np.pi)
-        u = np.random.rand(n).astype(np.float32) * 2 - 1
-        phi = np.arccos(u)
-
-        sp = (speed_rng[0] + (speed_rng[1]-speed_rng[0])*np.random.rand(n)).astype(np.float32)
-
-        vx = sp*np.sin(phi)*np.cos(theta)
-        vy = sp*np.cos(phi)
-        vz = sp*np.sin(phi)*np.sin(theta)
-        v = np.stack([vx,vy,vz], axis=1).astype(np.float32)
-
-        p = np.repeat(pos[None,:], n, axis=0).astype(np.float32)
-
-        c = np.zeros((n,4), dtype=np.float32)
-        for i in range(n):
-            r,g,b = hsv_to_rgb((base_h + random.uniform(-0.08,0.08))%1.0, 0.9, 1.0)
-            c[i,:3] = (r,g,b)
-        c[:,3]=1.0
-
-        s = (10 + 8*np.random.rand(n)).astype(np.float32)
-        l = (1.0 + 0.3*np.random.rand(n)).astype(np.float32)
-        self.ps.spawn(p,v,c,s,l)
-
-    def _ring(self, pos, base_h, n=220):
-        ang = np.linspace(0, 2*np.pi, n, endpoint=False).astype(np.float32)
-        sp = (10 + 4*np.random.rand(n)).astype(np.float32)
-        vx = sp*np.cos(ang)
-        vz = sp*np.sin(ang)
-        vy = (np.random.rand(n).astype(np.float32)-0.5)*2.0
-        v = np.stack([vx,vy,vz], axis=1).astype(np.float32)
-
-        p = np.repeat(pos[None,:], n, axis=0).astype(np.float32)
-
-        c = np.zeros((n,4), dtype=np.float32)
-        for i in range(n):
-            r,g,b = hsv_to_rgb((base_h + i/n*0.2)%1.0, 0.9, 1.0)
-            c[i,:3] = (r,g,b)
-        c[:,3]=1.0
-
-        s = np.full((n,), 12.0, dtype=np.float32)
-        l = np.full((n,), 1.1, dtype=np.float32)
-        self.ps.spawn(p,v,c,s,l)
-
-    def _heart(self, pos, n=240):
-        t = (np.random.rand(n).astype(np.float32) * 2*np.pi)
-        x = 16*np.sin(t)**3
-        y = 13*np.cos(t) - 5*np.cos(2*t) - 2*np.cos(3*t) - np.cos(4*t)
-
-        dir2 = np.stack([x,y], axis=1)
-        dir2 /= (np.linalg.norm(dir2, axis=1)[:,None] + 1e-6)
-
-        sp = (9 + 6*np.random.rand(n)).astype(np.float32)
-        vx = dir2[:,0]*sp*0.9
-        vy = dir2[:,1]*sp*0.9
-        vz = (np.random.rand(n).astype(np.float32)-0.5)*3.0
-        v = np.stack([vx,vy,vz], axis=1).astype(np.float32)
-
-        p = np.repeat(pos[None,:], n, axis=0).astype(np.float32)
-        c = np.zeros((n,4), dtype=np.float32)
-        c[:,:3] = np.array([1.0,0.35,0.55])  # pink
-        c[:,3]=1.0
-        s = (12 + 8*np.random.rand(n)).astype(np.float32)
-        l = np.full((n,), 1.2, dtype=np.float32)
-        self.ps.spawn(p,v,c,s,l)
-
-    def _spiral(self, pos, base_h, n=260):
-        t = np.linspace(0, 6*np.pi, n).astype(np.float32)
-        r = np.linspace(0.25, 1.0, n).astype(np.float32)
-        vx = np.cos(t)*r
-        vz = np.sin(t)*r
-        vy = (np.random.rand(n).astype(np.float32)*0.6 + 0.2)
-        d = np.stack([vx,vy,vz], axis=1)
-        d /= (np.linalg.norm(d, axis=1)[:,None] + 1e-6)
-
-        sp = (10 + 5*np.random.rand(n)).astype(np.float32)
-        v = d * sp[:,None]
-
-        p = np.repeat(pos[None,:], n, axis=0).astype(np.float32)
-        c = np.zeros((n,4), dtype=np.float32)
-        for i in range(n):
-            rr,gg,bb = hsv_to_rgb((base_h + i/n*0.35)%1.0, 0.9, 1.0)
-            c[i,:3] = (rr,gg,bb)
-        c[:,3]=1.0
-        s = (10 + 7*np.random.rand(n)).astype(np.float32)
-        l = np.full((n,), 1.15, dtype=np.float32)
-        self.ps.spawn(p,v,c,s,l)
-
-    def _crackle(self, pos, n=120):
-        ang = np.random.rand(n).astype(np.float32) * 2*np.pi
-        sp = (14 + 10*np.random.rand(n)).astype(np.float32)
-        vx = np.cos(ang)*sp
-        vz = np.sin(ang)*sp
-        vy = (np.random.rand(n).astype(np.float32)*6.0)
-        v = np.stack([vx,vy,vz], axis=1).astype(np.float32)
-
-        p = np.repeat(pos[None,:], n, axis=0).astype(np.float32)
-        c = np.zeros((n,4), dtype=np.float32)
-        c[:,:3] = np.array([1.0,0.75,0.25])  # gold
-        c[:,3]=1.0
-        s = np.full((n,), 7.0, dtype=np.float32)
-        l = (0.35 + 0.25*np.random.rand(n)).astype(np.float32)
-        self.ps.spawn(p,v,c,s,l)
-
-    def render(self, cam):
-        self.ps.render(cam)
-
-# =========================
-# Sky renderer (fullscreen quad)
-# =========================
-class Sky:
-    def __init__(self):
-        self.prog = make_program(SKY_VERT, SKY_FRAG)
-        quad = np.array([-1,-1,  1,-1,  1,1,  -1,1], dtype=np.float32)
-        idx  = np.array([0,1,2, 2,3,0], dtype=np.uint32)
-
-        self.vao = glGenVertexArrays(1)
-        glBindVertexArray(self.vao)
-
-        vbo = glGenBuffers(1)
-        glBindBuffer(GL_ARRAY_BUFFER, vbo)
-        glBufferData(GL_ARRAY_BUFFER, quad.nbytes, quad, GL_STATIC_DRAW)
-
-        ebo = glGenBuffers(1)
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo)
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL_STATIC_DRAW)
-
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,8,ctypes.c_void_p(0))
-
-        glBindVertexArray(0)
-
+                final_velocity = scaled_velocity
+            
+            # Generate color with variation
+            hue_offset = random.uniform(-0.1, 0.1)
+            final_hue = (base_hue + hue_offset) % 1.0
+            
+            r, g, b = self.hsv_to_rgb(final_hue, 0.9, 1.0)
+            
+            particle = Particle(
+                position=explosion_position.copy(),
+                velocity=final_velocity,
+                color=np.array([r, g, b, 1.0], dtype=np.float32),
+                life=1.0,
+                size=random.uniform(2.5, 4.5),
+                trail=[]
+            )
+            
+            self.particles.append(particle)
+    
+    @staticmethod
+    def hsv_to_rgb(h, s, v):
+        """Convert HSV to RGB"""
+        i = int(h * 6.0)
+        f = h * 6.0 - i
+        p = v * (1.0 - s)
+        q = v * (1.0 - f * s)
+        t = v * (1.0 - (1.0 - f) * s)
+        i = i % 6
+        
+        if i == 0: return v, t, p
+        if i == 1: return q, v, p
+        if i == 2: return p, v, t
+        if i == 3: return p, q, v
+        if i == 4: return t, p, v
+        if i == 5: return v, p, q
+        return v, v, v
+    
+    def update(self, dt):
+        """Update firework state"""
+        self.age += dt
+        
+        gravity = np.array([0.0, -9.8, 0.0], dtype=np.float32)
+        
+        # Update rocket
+        if not self.exploded and self.rocket:
+            # TRANSLATION: Update rocket position using transformation matrix
+            displacement = self.rocket.velocity * dt
+            T = TransformationMatrix.translation(displacement[0], displacement[1], displacement[2])
+            self.rocket.position = TransformationMatrix.apply_to_point(T, self.rocket.position)
+            
+            # Update velocity
+            self.rocket.velocity = self.rocket.velocity + gravity * dt
+            
+            # Trail
+            if len(self.rocket.trail) < 20:
+                self.rocket.trail.append(self.rocket.position.copy())
+            
+            # Decay
+            self.rocket.life -= dt * 0.5
+            self.rocket.color[3] = self.rocket.life
+            
+            # Explode when falling or life runs out
+            if self.rocket.velocity[1] < 0 or self.rocket.life <= 0:
+                self.explode()
+        
+        # Update particles
+        if self.exploded:
+            alive_particles = []
+            
+            for particle in self.particles:
+                # TRANSLATION: Update particle position using transformation matrix
+                displacement = particle.velocity * dt
+                T = TransformationMatrix.translation(displacement[0], displacement[1], displacement[2])
+                particle.position = TransformationMatrix.apply_to_point(T, particle.position)
+                
+                # SCALING: Apply drag to velocity (velocity scaling)
+                drag_factor = 0.98
+                S = TransformationMatrix.scaling(drag_factor, drag_factor, drag_factor)
+                particle.velocity = TransformationMatrix.apply_to_point(S, particle.velocity)
+                
+                # Update velocity with gravity
+                particle.velocity = particle.velocity + gravity * dt
+                
+                # Trail
+                if len(particle.trail) < 10:
+                    particle.trail.append(particle.position.copy())
+                else:
+                    particle.trail.pop(0)
+                    particle.trail.append(particle.position.copy())
+                
+                # Life decay
+                particle.life -= dt * 0.5
+                particle.color[3] = max(0.0, particle.life)
+                
+                if particle.life > 0:
+                    alive_particles.append(particle)
+            
+            self.particles = alive_particles
+            
+            return len(self.particles) > 0
+        
+        return True
+    
     def render(self):
-        glDisable(GL_DEPTH_TEST)
-        glUseProgram(self.prog)
-        glBindVertexArray(self.vao)
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, None)
-        glBindVertexArray(0)
-        glEnable(GL_DEPTH_TEST)
+        """Render firework"""
+        # Render rocket trail
+        if self.rocket and not self.exploded:
+            if len(self.rocket.trail) > 1:
+                glBegin(GL_LINE_STRIP)
+                for i, pos in enumerate(self.rocket.trail):
+                    alpha = (i / len(self.rocket.trail)) * self.rocket.color[3]
+                    glColor4f(1.0, 1.0, 0.5, alpha * 0.5)
+                    glVertex3f(pos[0], pos[1], pos[2])
+                glEnd()
+            
+            # Render rocket
+            glPointSize(self.rocket.size)
+            glBegin(GL_POINTS)
+            glColor4f(self.rocket.color[0], self.rocket.color[1], 
+                     self.rocket.color[2], self.rocket.color[3])
+            glVertex3f(self.rocket.position[0], self.rocket.position[1], self.rocket.position[2])
+            glEnd()
+        
+        # Render particles
+        for particle in self.particles:
+            # Trail
+            if len(particle.trail) > 1:
+                glBegin(GL_LINE_STRIP)
+                for i, pos in enumerate(particle.trail):
+                    alpha = (i / len(particle.trail)) * particle.color[3] * 0.3
+                    glColor4f(particle.color[0], particle.color[1], particle.color[2], alpha)
+                    glVertex3f(pos[0], pos[1], pos[2])
+                glEnd()
+            
+            # Glow (outer)
+            glPointSize(particle.size * 2.5)
+            glBegin(GL_POINTS)
+            glColor4f(particle.color[0], particle.color[1], particle.color[2], particle.color[3] * 0.2)
+            glVertex3f(particle.position[0], particle.position[1], particle.position[2])
+            glEnd()
+            
+            # Core
+            glPointSize(particle.size)
+            glBegin(GL_POINTS)
+            glColor4f(particle.color[0], particle.color[1], particle.color[2], particle.color[3])
+            glVertex3f(particle.position[0], particle.position[1], particle.position[2])
+            glEnd()
 
-# =========================
-# Main
-# =========================
+
+# ============================================================================
+# CAMERA SYSTEM
+# ============================================================================
+
+class Camera:
+    """First-person camera with mouse look"""
+    
+    def __init__(self):
+        self.position = np.array([0.0, 8.0, 35.0], dtype=np.float32)
+        self.yaw = -90.0
+        self.pitch = 0.0
+        self.speed = 18.0
+        self.sensitivity = 0.1
+        self.fov = 50.0
+        
+        self.front = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        self.up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        self.right = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        
+        self.last_x = 400
+        self.last_y = 300
+        self.first_mouse = True
+        
+        self.update_vectors()
+    
+    def update_vectors(self):
+        """Update camera direction vectors"""
+        front_x = math.cos(math.radians(self.yaw)) * math.cos(math.radians(self.pitch))
+        front_y = math.sin(math.radians(self.pitch))
+        front_z = math.sin(math.radians(self.yaw)) * math.cos(math.radians(self.pitch))
+        
+        front_length = math.sqrt(front_x**2 + front_y**2 + front_z**2)
+        self.front = np.array([front_x/front_length, front_y/front_length, front_z/front_length], dtype=np.float32)
+        
+        # Calculate right vector
+        right_x = self.front[1] * 0.0 - self.front[2] * 1.0
+        right_y = self.front[2] * 0.0 - self.front[0] * 0.0
+        right_z = self.front[0] * 1.0 - self.front[1] * 0.0
+        right_length = math.sqrt(right_x**2 + right_y**2 + right_z**2)
+        self.right = np.array([right_x/right_length, right_y/right_length, right_z/right_length], dtype=np.float32)
+        
+        # Calculate up vector
+        up_x = self.right[1] * self.front[2] - self.right[2] * self.front[1]
+        up_y = self.right[2] * self.front[0] - self.right[0] * self.front[2]
+        up_z = self.right[0] * self.front[1] - self.right[1] * self.front[0]
+        self.up = np.array([up_x, up_y, up_z], dtype=np.float32)
+    
+    def process_mouse(self, xpos, ypos):
+        """Handle mouse movement"""
+        if self.first_mouse:
+            self.last_x = xpos
+            self.last_y = ypos
+            self.first_mouse = False
+        
+        xoffset = xpos - self.last_x
+        yoffset = self.last_y - ypos
+        self.last_x = xpos
+        self.last_y = ypos
+        
+        xoffset *= self.sensitivity
+        yoffset *= self.sensitivity
+        
+        self.yaw += xoffset
+        self.pitch += yoffset
+        
+        if self.pitch > 89.0:
+            self.pitch = 89.0
+        if self.pitch < -89.0:
+            self.pitch = -89.0
+        
+        self.update_vectors()
+    
+    def process_scroll(self, yoffset):
+        """Handle scroll for zoom"""
+        self.fov -= yoffset * 2
+        if self.fov < 20.0:
+            self.fov = 20.0
+        if self.fov > 80.0:
+            self.fov = 80.0
+    
+    def get_view_matrix(self):
+        """Get view matrix components"""
+        center = self.position + self.front
+        return self.position, center, self.up
+
+
+# ============================================================================
+# MAIN SIMULATION
+# ============================================================================
+
+class FireworkSimulation:
+    """Main simulation controller"""
+    
+    def __init__(self):
+        self.fireworks = []
+        self.camera = Camera()
+        self.auto_launch = True
+        self.last_launch = 0
+        self.launch_interval = 1.8
+        
+        self.firework_types = ["burst", "ring", "fountain", "willow"]
+        self.current_type = 0
+    
+    def add_firework(self, position=None, fw_type=None):
+        """Add new firework"""
+        if position is None:
+            position = np.array([
+                random.uniform(-20.0, 20.0),
+                0.0,
+                random.uniform(-20.0, 20.0)
+            ], dtype=np.float32)
+        
+        if fw_type is None:
+            fw_type = random.choice(self.firework_types)
+        
+        self.fireworks.append(Firework(position, fw_type))
+    
+    def cycle_type(self):
+        """Cycle through firework types"""
+        self.current_type = (self.current_type + 1) % len(self.firework_types)
+        print(f"Firework type: {self.firework_types[self.current_type]}")
+    
+    def update(self, dt):
+        """Update simulation"""
+        current_time = time.time()
+        
+        if self.auto_launch and current_time - self.last_launch > self.launch_interval:
+            self.add_firework()
+            self.last_launch = current_time
+        
+        alive = []
+        for fw in self.fireworks:
+            if fw.update(dt):
+                alive.append(fw)
+        self.fireworks = alive
+    
+    def render(self):
+        """Render scene"""
+        # Ground grid
+        glColor4f(0.2, 0.25, 0.3, 0.4)
+        glBegin(GL_LINES)
+        for i in range(-50, 51, 5):
+            glVertex3f(i, 0, -50)
+            glVertex3f(i, 0, 50)
+            glVertex3f(-50, 0, i)
+            glVertex3f(50, 0, i)
+        glEnd()
+        
+        # Render fireworks
+        for fw in self.fireworks:
+            fw.render()
+
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
 def main():
+    """Main entry point"""
     if not glfw.init():
-        raise RuntimeError("GLFW init failed")
+        return
 
-    # Core profile
-    glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-    glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
-    glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
-    glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, glfw.TRUE)
-
-    W, H = 1280, 720
-    window = glfw.create_window(W, H, "Modern Fireworks (Single File)", None, None)
+    glfw.window_hint(glfw.RESIZABLE, glfw.FALSE)
+    glfw.window_hint(glfw.DOUBLEBUFFER, glfw.TRUE)
+    
+    width, height = 1200, 800
+    window = glfw.create_window(width, height, "3D Fireworks - Manual Transformation Matrices", None, None)
+    
     if not window:
         glfw.terminate()
-        raise RuntimeError("Window creation failed")
-
+        return
+    
     glfw.make_context_current(window)
     glfw.set_input_mode(window, glfw.CURSOR, glfw.CURSOR_DISABLED)
-
-    glViewport(0,0,W,H)
-    glEnable(GL_BLEND)
+    
+    # OpenGL settings
     glEnable(GL_DEPTH_TEST)
-
-    cam = Camera()
-    sky = Sky()
-    fw = Fireworks()
-
-    last = time.time()
-    fps_timer = time.time()
-    frames = 0
-    fps = 0.0
-
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glEnable(GL_POINT_SMOOTH)
+    glEnable(GL_LINE_SMOOTH)
+    glHint(GL_POINT_SMOOTH_HINT, GL_NICEST)
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
+    glClearColor(0.01, 0.01, 0.05, 1.0)
+    
+    sim = FireworkSimulation()
+    keys = {}
+    
+    def key_callback(window, key, scancode, action, mods):
+        if action == glfw.PRESS:
+            keys[key] = True
+            if key == glfw.KEY_ESCAPE:
+                glfw.set_window_should_close(window, True)
+            elif key == glfw.KEY_R:
+                sim.auto_launch = not sim.auto_launch
+                print(f"Auto-launch: {'ON' if sim.auto_launch else 'OFF'}")
+            elif key == glfw.KEY_T:
+                sim.cycle_type()
+        elif action == glfw.RELEASE:
+            keys[key] = False
+    
+    def mouse_callback(window, xpos, ypos):
+        sim.camera.process_mouse(xpos, ypos)
+    
+    def scroll_callback(window, xoffset, yoffset):
+        sim.camera.process_scroll(yoffset)
+    
+    def mouse_button_callback(window, button, action, mods):
+        if button == glfw.MOUSE_BUTTON_LEFT and action == glfw.PRESS:
+            pos = sim.camera.position + sim.camera.front * 12
+            pos[1] = 0
+            sim.add_firework(pos, sim.firework_types[sim.current_type])
+    
+    glfw.set_key_callback(window, key_callback)
+    glfw.set_cursor_pos_callback(window, mouse_callback)
+    glfw.set_scroll_callback(window, scroll_callback)
+    glfw.set_mouse_button_callback(window, mouse_button_callback)
+    
+    print("=" * 70)
+    print("3D FIREWORKS SIMULATION - MANUAL TRANSFORMATION MATRICES")
+    print("=" * 70)
+    print("\nTRANSFORMATIONS IMPLEMENTED:")
+    print("  ✓ Translation - Manual 4x4 matrix")
+    print("  ✓ Rotation - X, Y, Z, and arbitrary axis (Rodrigues' formula)")
+    print("  ✓ Scaling - Uniform and non-uniform")
+    print("  ✓ Shearing - XY, XZ, YZ planes")
+    print("\nCONTROLS:")
+    print("  Mouse       - Look around")
+    print("  W/A/S/D     - Move camera")
+    print("  SPACE/SHIFT - Up/Down")
+    print("  Scroll      - Zoom")
+    print("  Left Click  - Launch firework")
+    print("  R           - Toggle auto-launch")
+    print("  T           - Cycle firework types")
+    print("  ESC         - Exit")
+    print("\nFIREWORK TYPES:")
+    print("  1. Burst     - Rotation + Scaling")
+    print("  2. Ring      - Scaling (flatten)")
+    print("  3. Fountain  - Shearing + Scaling")
+    print("  4. Willow    - Shearing + Rotation")
+    print("=" * 70)
+    print("\nStarting simulation...\n")
+    
+    last_time = glfw.get_time()
+    
     while not glfw.window_should_close(window):
-        now = time.time()
-        dt = now - last
-        last = now
-
-        glfw.poll_events()
-
-        if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
-            glfw.set_window_should_close(window, True)
-
-        # toggle auto
-        if glfw.get_key(window, glfw.KEY_R) == glfw.PRESS:
-            fw.auto = True
-
-        cam.update(window, dt, W/H)
-        fw.update(dt)
-
-        # Render
+        current_time = glfw.get_time()
+        dt = current_time - last_time
+        last_time = current_time
+        
+        # Input
+        if keys.get(glfw.KEY_W):
+            sim.camera.position += sim.camera.front * sim.camera.speed * dt
+        if keys.get(glfw.KEY_S):
+            sim.camera.position -= sim.camera.front * sim.camera.speed * dt
+        if keys.get(glfw.KEY_A):
+            sim.camera.position -= sim.camera.right * sim.camera.speed * dt
+        if keys.get(glfw.KEY_D):
+            sim.camera.position += sim.camera.right * sim.camera.speed * dt
+        if keys.get(glfw.KEY_SPACE):
+            sim.camera.position += sim.camera.up * sim.camera.speed * dt
+        if keys.get(glfw.KEY_LEFT_SHIFT):
+            sim.camera.position -= sim.camera.up * sim.camera.speed * dt
+        
+        sim.update(dt)
+        
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        sky.render()
-        fw.render(cam)
-
+        
+        # Projection
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(sim.camera.fov, width/height, 0.1, 500.0)
+        
+        # View
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        eye, center, up = sim.camera.get_view_matrix()
+        gluLookAt(eye[0], eye[1], eye[2],
+                  center[0], center[1], center[2],
+                  up[0], up[1], up[2])
+        
+        sim.render()
+        
         glfw.swap_buffers(window)
-
-        # window title as UI
-        frames += 1
-        if now - fps_timer > 0.5:
-            fps = frames / (now - fps_timer)
-            frames = 0
-            fps_timer = now
-            glfw.set_window_title(window, f"Modern Fireworks | FPS: {fps:.1f} | Particles: {fw.ps.count}")
-
+        glfw.poll_events()
+    
     glfw.terminate()
 
+
 if __name__ == "__main__":
-    print("Controls: Mouse Look, WASD, Space/Shift, ESC exit")
-    print("Auto fireworks on. (You can extend toggles easily.)")
     main()
